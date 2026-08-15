@@ -2,13 +2,17 @@
 
 [![CI](https://github.com/xdcte5/Ritsus/actions/workflows/ci.yml/badge.svg)](https://github.com/xdcte5/Ritsus/actions/workflows/ci.yml)
 
-## What this is
+Ritsus is a compact double-entry ledger API built with FastAPI and SQLAlchemy. It records balanced, integer-cent journal transactions, derives account balances from immutable entry history, and verifies persisted ledger invariants on demand.
 
-Ritsus is a compact double-entry accounting service for payments-style workflows. It posts balanced, integer-cent journal transactions through FastAPI and can prove its persisted ledger invariants on demand. The implementation favors visible correctness over feature breadth.
+## Guarantees
 
-## Why it exists
-
-Moving money correctly is not just an API problem: retries, races, partial failures, and corrections all threaten the accounting record. Ritsus explores a foundational payments-infrastructure problem—money must move atomically and provably—without claiming production scale. Its guarantees are exercised through integration, concurrency, corruption, and property-based tests rather than asserted only in documentation.
+- **Balanced transactions:** every posting must contain equal debit and credit totals.
+- **Atomic posting:** transaction metadata and all journal entries commit together or roll back together.
+- **Concurrency-safe spending:** SQLite writes use `BEGIN IMMEDIATE`, ensuring funds decisions are made from an authoritative snapshot.
+- **Payload-bound idempotency:** replaying the same `Idempotency-Key` and payload returns the original transaction; reusing the key with different data returns `409 idempotency_conflict`.
+- **Additive reversals:** corrections append compensating entries rather than modifying or deleting original journal entries.
+- **Derived balances:** accounts have no stored balance column that can drift from their entries.
+- **Self-auditing storage:** `/audit/verify` recomputes arithmetic, transaction shape, references, integer capacity, and nonnegative-balance invariants from persisted data.
 
 ## Architecture
 
@@ -25,15 +29,11 @@ SQLite journal (WAL mode)
 Alembic schema migrations
 ```
 
-- **Derived balances:** an account has no balance column. Its normal balance is recomputed from entries, so cached state cannot drift from the journal.
-- **Serialized writes:** completed retries use a cheap optimistic idempotency lookup; every new posting then acquires `BEGIN IMMEDIATE` and authoritatively rechecks idempotency before account and balance reads. SQLite writers queue rather than make write decisions from stale snapshots.
-- **Bound idempotency:** an `Idempotency-Key` returns the original transaction only when stored description and ordered entries match; a different payload receives `409 idempotency_conflict`.
-- **Additive reversals:** the application exposes no entry update/delete path. Reversal entries, the direct-reversal link, and the source status projection commit atomically.
-- **True normal balances:** debits increase assets/expenses; credits increase liabilities/equity/revenue. Custodial wallets are platform liabilities, so a payment debits the payer wallet and credits recipient liability plus revenue.
+Ritsus follows standard accounting normal balances: debits increase assets and expenses, while credits increase liabilities, equity, and revenue. Custodial customer wallets are represented as platform liabilities.
 
-## How to run
+## Quick start
 
-Python 3.11 or newer is required. API startup applies the checked-in Alembic migrations automatically. The demo resets `ledger.db`, so run it **before** starting the API.
+Python 3.11 or newer is required.
 
 ```bash
 python -m venv .venv
@@ -43,63 +43,112 @@ python scripts/seed_demo.py
 ./run.sh
 ```
 
-Then open `http://127.0.0.1:8000/docs` for the interactive API. The deterministic demo ends with `LEDGER BALANCED ✅` and leaves its database available to the server. Set `DATABASE_URL` to use a different SQLite file, for example `DATABASE_URL=sqlite:///./dev.db ./run.sh`.
+Open `http://127.0.0.1:8000/docs` for the interactive OpenAPI interface.
 
-For a production-shaped local process without development reload:
+The demo resets `ledger.db`, creates a set of platform and wallet accounts, posts deposits and payments, rejects an overdraft, reverses a transfer, and finishes with a complete ledger audit.
+
+Set `DATABASE_URL` to use another SQLite file:
+
+```bash
+DATABASE_URL=sqlite:///./dev.db ./run.sh
+```
+
+API startup automatically applies all checked-in Alembic migrations.
+
+## Docker
 
 ```bash
 docker build -t ritsus .
 docker run --rm -p 8000:8000 ritsus
 ```
 
-The image runs as a non-root user and creates/migrates its SQLite database on startup. This `--rm` command is an ephemeral demo: removing the container discards its journal. Mount a dedicated writable directory and point `DATABASE_URL` there if persistence is required.
+The image runs as a non-root user and exposes a readiness-based health check. The command above is ephemeral: removing the container discards its SQLite journal. For persistent use, mount a writable data directory and point `DATABASE_URL` to a database file within it.
 
-## How to test
+## Testing
+
+Install the development dependencies, then run:
 
 ```bash
-. .venv/bin/activate
 ruff check .
 pytest --cov=app --cov-report=term-missing -q
 ```
 
-`.github/workflows/ci.yml` runs the suite on Python 3.11–3.14, enforces lint and 85% branch-aware coverage, repeats the concurrency gate, validates migration upgrade/drift/downgrade, and builds and smoke-tests the non-root container. The focused race proof is `tests/test_concurrency.py`: 50 independent HTTP requests and database sessions compete to spend a 1,000-cent wallet; exactly 10 commit and 40 receive the expected insufficient-funds response. `tests/test_invariants.py` uses Hypothesis for 200 balanced and 200 deliberately unbalanced examples. To repeat the race stability gate:
+The test suite includes:
+
+- direct posting and reversal unit tests;
+- HTTP integration and stable error-contract tests;
+- raw-SQL corruption and audit-detection tests;
+- payload-bound and concurrent idempotency tests;
+- Alembic migration, legacy-schema validation, and malformed-schema rejection tests;
+- 200 generated balanced and 200 generated unbalanced Hypothesis examples; and
+- a 50-request concurrent overspend race using independent HTTP requests and database sessions.
+
+To repeat the concurrency stability gate:
 
 ```bash
-for i in 1 2 3 4 5; do pytest tests/test_concurrency.py -v || exit 1; done
+for i in 1 2 3 4 5; do
+  pytest tests/test_concurrency.py -q || exit 1
+done
 ```
 
-## API reference
+GitHub Actions runs the suite on Python 3.11–3.14, enforces lint and an 85% branch-aware coverage floor, validates migration upgrade/drift/downgrade, repeats the concurrency gate, and builds and smoke-tests the non-root container.
+
+## API
 
 | Method | Path | Behavior |
 |---|---|---|
-| `POST` | `/accounts` | Create a USD account; returns its derived balance |
-| `GET` | `/accounts/{id}` | Read account metadata and live balance |
-| `GET` | `/accounts/{id}/entries` | Read the chronological, append-only statement |
+| `POST` | `/accounts` | Create a USD account and return its derived balance |
+| `GET` | `/accounts/{id}` | Read account metadata and current balance |
+| `GET` | `/accounts/{id}/entries` | Read the account's chronological journal entries |
 | `POST` | `/transactions` | Atomically post balanced entries; accepts `Idempotency-Key` |
 | `GET` | `/transactions/{id}` | Read a transaction and its entries |
-| `POST` | `/transactions/{id}/reverse` | Append or return the one direct reversal |
-| `GET` | `/audit/verify` | Recompute global, transaction, shape, referential, and nonnegative invariants |
-| `GET` | `/health` | Cheap process-liveness response |
-| `GET` | `/health/ready` | Verify database connectivity; returns `503` when unavailable |
+| `POST` | `/transactions/{id}/reverse` | Append or return the transaction's direct reversal |
+| `GET` | `/audit/verify` | Verify persisted ledger invariants |
+| `GET` | `/health` | Process liveness check |
+| `GET` | `/health/ready` | Database readiness check |
 
-Expected ledger failures have stable JSON shapes. Unbalanced requests return `422`; insufficient funds and idempotency payload conflicts return `409`; missing accounts or transactions return `404`. An unhealthy audit deliberately returns `500`.
+### Error responses
 
-## Design decisions and tradeoffs
+Expected domain failures use stable JSON responses:
 
-- **Balances are derived, never cached.** This eliminates a class of drift bugs at the cost of an O(n) per-account journal aggregation. At hundreds of thousands of entries per account, a production design would add rebuildable snapshots or a materialized balance while retaining entries as source of truth.
-- **SQLite plus `BEGIN IMMEDIATE` targets one host.** It provides clear serialized-write correctness for this demonstration. `DATABASE_URL` is configurable, but only SQLite behavior is currently tested; a multi-process or multi-node system should move to PostgreSQL and lock touched accounts with `SELECT ... FOR UPDATE`, allowing unrelated accounts to post concurrently.
-- **Schema changes are migration-managed.** API startup runs `alembic upgrade head`; the direct `create_all()` helper remains only for isolated tests and the deliberately resettable demo. The baseline migration adopts a pre-Alembic database only after validating its columns, primary/foreign keys, checks, unique constraints, and indexes; incompatible or partial schemas fail startup.
-- **Account deltas are aggregated before funds checks.** Repeated lines against one account cannot bypass the nonnegative invariant and behave identically regardless of line order.
-- **Journal correction is additive.** The API never mutates or deletes entries; a reversal appends compensating entries. This is application-enforced rather than tamper-proof storage—the audit detects arithmetic, shape, reference, and nonnegative-balance corruption, but a production system would add stricter database permissions or tamper-evident hashes. The original transaction's `status` is a mutable projection recording that a direct reversal exists.
-- **One direct reversal is database-enforced.** A retry returns the existing reversal, while that reversal can itself be reversed by targeting its own ID. A reversal can legitimately fail if credited funds have since been spent; no reversal metadata or entries then commit.
-- **USD only.** Adding currency labels without per-currency journals or exchange-rate snapshots would make nominal cent totals meaningless, so non-USD account creation is rejected.
-- **Application-enforced cross-row invariants.** SQLite cannot express debit-equals-credit across journal rows as a simple constraint. The posting engine enforces it atomically, while the audit detects arithmetic, malformed-transaction, orphan-reference, and forbidden-negative-balance tampering.
-- **Bounded integer aggregates.** Individual amounts and cumulative journal totals are constrained to SQLite's signed 64-bit range before commit; audit and balance calculations sum in Python so corrupt out-of-band data is reported rather than crashing SQL aggregation.
+- unbalanced or invalid transactions: `422`;
+- insufficient funds or idempotency conflicts: `409`;
+- missing accounts or transactions: `404`;
+- unhealthy audit: `500`;
+- unavailable database readiness check: `503`.
 
-## Future work
+## Design details
 
-The highest-value next steps are a PostgreSQL posting path with deterministic account-row locking, a transactional outbox with idempotent consumers, cursor-paginated statements, authentication and tenant authorization, and tamper-evident audit checkpoints. These are deliberately not claimed by the current implementation.
+### Balances
 
-## Validation evidence
+Balances are calculated by folding an account's journal entries according to its normal balance. This prevents cached state from diverging from the accounting record. Balance reads are O(entries for the account), so large deployments would require a rebuildable snapshot or materialized-balance strategy while retaining entries as the source of truth.
 
-Validated locally on Python 3.14.6 (CI is configured for the declared Python 3.11–3.14 matrix). The release-hardening run completed with **39 tests passing**, **90.78% branch-aware coverage**, zero failures, and zero skips; Alembic upgrade/check/downgrade, validated legacy-schema adoption, and malformed-schema rejection passed; the concurrency gate passed five consecutive times; the demo ended with equal 40,000-cent debit and credit totals; and the non-root Docker container returned `{"status":"ready"}`. See the CI workflow and test files for executable claims.
+### Write serialization
+
+Every new SQLite posting acquires `BEGIN IMMEDIATE` before reading accounts or balances. Concurrent writers queue, and each funds decision observes previously committed writes. Entry deltas are aggregated by account before funds checks, preventing repeated lines from bypassing the nonnegative-balance rule.
+
+### Reversals
+
+A reversal posts a new transaction with every direction flipped. Original entries remain unchanged. The source transaction's `status` is a mutable projection indicating that a direct reversal exists, and a database uniqueness constraint allows only one direct reversal per transaction.
+
+A reversal can fail if its projected effect would overdraw an account. In that case, no reversal entries or metadata are committed.
+
+### Schema management
+
+API startup runs `alembic upgrade head`. Direct SQLAlchemy metadata creation is reserved for isolated tests and the resettable demo.
+
+The baseline migration adopts a pre-Alembic Ritsus database only after validating its columns, primary and foreign keys, check expressions, unique constraints, and indexes. Partial or incompatible schemas fail migration instead of being silently stamped as current.
+
+## Deployment scope
+
+The current implementation is designed for a single-host SQLite deployment. It does not provide authentication, tenant authorization, multi-currency accounting, externally signed audit checkpoints, or multi-node write coordination.
+
+For multi-process or multi-node writes, the posting path should move to PostgreSQL and lock all touched account rows in deterministic order with `SELECT ... FOR UPDATE` before deriving balances and evaluating projected funds.
+
+## Verification
+
+The current suite contains **39 tests** with **90.78% branch-aware coverage**. The concurrency test has passed five consecutive runs, the deterministic demo finishes with equal 40,000-cent debit and credit totals, and the container smoke test verifies readiness, Docker health, and non-root execution.
+
+## License
+
+Ritsus is available under the [MIT License](LICENSE).

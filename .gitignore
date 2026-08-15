@@ -1,0 +1,12 @@
+ledger.db
+ledger.db-shm
+ledger.db-wal
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.hypothesis/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+.pi-subagents/

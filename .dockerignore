@@ -1,0 +1,16 @@
+.git
+.github
+.pi-subagents
+.venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.hypothesis
+.coverage
+htmlcov
+ledger.db
+ledger.db-shm
+ledger.db-wal
+tests
+docs
+*.pdf

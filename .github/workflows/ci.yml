@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: pip install -r requirements-dev.txt
+      - run: pytest -q
+
+  quality:
+    name: Quality and migration gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - run: python -m pip install --upgrade pip
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check .
+      - run: pytest --cov=app --cov-report=term-missing -q
+      - name: Upgrade an empty database
+        env:
+          DATABASE_URL: sqlite:////tmp/ritsus-migration.db
+        run: |
+          alembic upgrade head
+          alembic check
+          python - <<'PY'
+          import sqlite3
+          connection = sqlite3.connect("/tmp/ritsus-migration.db")
+          tables = {row[0] for row in connection.execute(
+              "SELECT name FROM sqlite_master WHERE type='table'"
+          )}
+          assert {"accounts", "transactions", "entries", "alembic_version"} <= tables
+          PY
+          alembic downgrade base
+          python - <<'PY'
+          import sqlite3
+          connection = sqlite3.connect("/tmp/ritsus-migration.db")
+          tables = {row[0] for row in connection.execute(
+              "SELECT name FROM sqlite_master WHERE type='table'"
+          )}
+          assert not ({"accounts", "transactions", "entries"} & tables)
+          PY
+      - name: Repeat concurrency gate
+        run: for i in 1 2 3 4 5; do pytest tests/test_concurrency.py -q || exit 1; done
+
+  container:
+    name: Container build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: ritsus:ci
+      - name: Smoke-test non-root container and readiness
+        run: |
+          docker run --rm -d --name ritsus-ci -p 18000:8000 ritsus:ci
+          trap 'docker rm -f ritsus-ci >/dev/null 2>&1 || true' EXIT
+          response=''
+          for _ in $(seq 1 30); do
+            if response=$(curl -fsS http://127.0.0.1:18000/health/ready 2>/dev/null); then
+              break
+            fi
+            sleep 1
+          done
+          test "$response" = '{"status":"ready"}'
+          test "$(docker exec ritsus-ci id -u)" != "0"
+          for _ in $(seq 1 20); do
+            status=$(docker inspect --format '{{.State.Health.Status}}' ritsus-ci)
+            test "$status" = healthy && break
+            sleep 1
+          done
+          test "$status" = healthy
